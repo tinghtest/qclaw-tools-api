@@ -4,12 +4,27 @@
  */
 const express = require('express');
 const QRCode = require('qrcode');
-const { Jimp, loadFont, measureText, measureTextHeight, rgbaToInt, cssColorToHex } = require('jimp');
+const { Jimp, JimpMime, loadFont, measureText, measureTextHeight, rgbaToInt, cssColorToHex } = require('jimp');
 const cors = require('cors');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
+
+// ─── 字体缓存 ──────────────────────────
+let fontCache = {};
+async function getFont(size = 64) {
+  const key = `sans-${size}`;
+  if (fontCache[key]) return fontCache[key];
+  try {
+    const font = await loadFont(`Jimp.FONT_SANS_${size}_BLACK`);
+    fontCache[key] = font;
+    return font;
+  } catch (e) {
+    fontCache[key] = null; // 缓存失败，避免重复尝试
+    return null;
+  }
+}
 
 // ─── 首页 ───────────────────────────────
 app.get('/', (req, res) => {
@@ -47,10 +62,23 @@ app.get('/health', (req, res) => {
 });
 
 // ─── 工具：加载图片 ────────────────────
+async function fetchBuffer(url) {
+  return new Promise((res, rej) => {
+    const mod = url.startsWith('https') ? require('https') : require('http');
+    const req = mod.get(url, { headers: { 'User-Agent': 'QClaw/1.0' } }, r => {
+      const chunks = [];
+      r.on('data', c => chunks.push(c));
+      r.on('end', () => res(Buffer.concat(chunks)));
+    });
+    req.on('error', rej);
+    req.setTimeout(10000, () => { req.destroy(); rej(new Error('请求超时')); });
+  });
+}
+
 async function loadImage(body) {
   if (body.url) {
-    const r = await fetch(body.url);
-    return await Jimp.read(Buffer.from(await r.arrayBuffer()));
+    const buf = await fetchBuffer(body.url);
+    return await Jimp.read(buf);
   }
   if (body.image) {
     const str = body.image;
@@ -62,7 +90,7 @@ async function loadImage(body) {
 
 // ─── 工具：输出图片 ────────────────────
 function outputImg(img, format = 'png') {
-  const mime = format === 'jpg' || format === 'jpeg' ? Jimp.MIME_JPEG : Jimp.MIME_PNG;
+  const mime = format === 'jpg' || format === 'jpeg' ? JimpMime.jpeg : JimpMime.png;
   const buf = img.getBuffer(mime);
   return `data:${mime};base64,${buf.toString('base64')}`;
 }
@@ -96,44 +124,35 @@ app.post('/image/beautify', async (req, res) => {
 // ─── 3. 生成表情包 ────────────────────
 app.post('/image/meme', async (req, res) => {
   try {
-    const { topText, bottomText, image, bgColor = '#FFFFFF', format = 'png' } = req.body;
+    const { topText, bottomText, image, format = 'png' } = req.body;
     let img;
     if (image) {
       img = await loadImage({ image });
       img.cover({ w: 500, h: 500 });
     } else {
-      img = new Jimp({ width: 500, height: 500, color: rgbaToInt(255, 255, 255, 255) });
+      img = new Jimp({ width: 500, height: 500, color: '#FFFFFFFF' });
     }
     const w = img.width, h = img.height;
+    const font = await getFont(64);
 
-    const font = await loadFont(Jimp.FONT_SANS_64_WHITE);
-    const fontH = measureTextHeight(font, 'M', w);
-
-    if (topText) {
-      const text = topText.toUpperCase();
-      const tw = measureText(font, text);
-      const x = Math.floor((w - tw) / 2);
-      img.print({ text, x, y: 10, font, color: '#000000FF' });
-      img.print({ text, x: x - 2, y: 10, font, color: '#000000FF' });
-      img.print({ text, x: x + 2, y: 10, font, color: '#000000FF' });
-      img.print({ text, x, y: 8, font, color: '#000000FF' });
-      img.print({ text, x, y: 12, font, color: '#000000FF' });
-      img.print({ text, x: x - 1, y: 9, font, color: '#FFFFFFFF' });
-      img.print({ text, x: x + 1, y: 9, font, color: '#FFFFFFFF' });
+    if (font) {
+      if (topText) {
+        const text = topText.toUpperCase();
+        const tw = measureText(font, text);
+        const x = Math.floor((w - tw) / 2);
+        img.print({ text, x, y: 15, font, color: '#000000FF' });
+        img.print({ text, x: x - 1, y: 15, font, color: '#FFFFFFFF' });
+      }
+      if (bottomText) {
+        const text = bottomText.toUpperCase();
+        const tw = measureText(font, text);
+        const x = Math.floor((w - tw) / 2);
+        const fontH = measureTextHeight(font, 'M', w);
+        img.print({ text, x, y: h - fontH - 20, font, color: '#000000FF' });
+        img.print({ text, x: x - 1, y: h - fontH - 20, font, color: '#FFFFFFFF' });
+      }
     }
-    if (bottomText) {
-      const text = bottomText.toUpperCase();
-      const tw = measureText(font, text);
-      const x = Math.floor((w - tw) / 2);
-      const y = h - fontH - 15;
-      img.print({ text, x: x - 2, y, font, color: '#000000FF' });
-      img.print({ text, x: x + 2, y, font, color: '#000000FF' });
-      img.print({ text, x, y: y - 2, font, color: '#000000FF' });
-      img.print({ text, x, y: y + 2, font, color: '#000000FF' });
-      img.print({ text, x: x - 1, y, font, color: '#FFFFFFFF' });
-      img.print({ text, x: x + 1, y, font, color: '#FFFFFFFF' });
-    }
-    res.json({ success: true, data: outputImg(img, format) });
+    res.json({ success: true, font_loaded: !!font, data: outputImg(img, format) });
   } catch (e) { res.status(500).json({ error: '表情包生成失败: ' + e.message }); }
 });
 
@@ -146,7 +165,7 @@ app.post('/image/filter', async (req, res) => {
       case 'grayscale': case 'gray': img.greyscale(); break;
       case 'invert': img.invert(); break;
       case 'sepia': img.color([{ apply: 'sepia', params: [100] }]); break;
-      case 'vintage': img.greyscale().contrast(0.2).color([{ apply: 'saturate', params: [-30] }]); break;
+      case 'vintage': img.greyscale().contrast(0.2); break;
       case 'cool': img.color([{ apply: 'lighten', params: [10] }, { apply: 'desaturate', params: [20] }]); break;
       case 'warm': img.color([{ apply: 'saturate', params: [20] }, { apply: 'hue', params: [15] }]); break;
       case 'bright': img.brightness(0.3).contrast(0.1); break;
@@ -164,7 +183,7 @@ app.get('/image/thumbnail', async (req, res) => {
   try {
     const { url, size = 200 } = req.query;
     if (!url) return res.status(400).json({ error: '需要 url 参数' });
-    const img = await Jimp.read(Buffer.from(await (await fetch(url)).arrayBuffer()));
+    const img = await Jimp.read(await fetchBuffer(url));
     img.cover({ w: parseInt(size), h: parseInt(size) });
     res.json({ success: true, size: parseInt(size), data: outputImg(img, 'jpg') });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -176,18 +195,21 @@ app.post('/image/watermark', async (req, res) => {
     const { text, opacity = 1, position = 'bottom-right', format = 'png' } = req.body;
     const img = await loadImage(req.body);
     const w = img.width, h = img.height;
-    const font = await loadFont(Jimp.FONT_SANS_16_WHITE);
-    const tw = measureText(font, text);
-    const th = measureTextHeight(font, text, w);
-    const pad = 10;
-    let x = pad, y = h - th - pad;
-    if (position === 'bottom-left') { x = pad; y = h - th - pad; }
-    else if (position === 'top-left') { x = pad; y = pad; }
-    else if (position === 'top-right') { x = w - tw - pad; y = pad; }
-    else if (position === 'center') { x = Math.floor((w - tw) / 2); y = Math.floor((h - th) / 2); }
-    else { x = w - tw - pad; } // bottom-right
-    img.print({ text, x, y, font, color: '#000000AA' });
-    res.json({ success: true, data: outputImg(img, format) });
+    const font = await getFont(16);
+    if (font) {
+      const w = img.width, h = img.height;
+      const tw = measureText(font, text);
+      const th = measureTextHeight(font, text, w);
+      const pad = 10;
+      let x = pad, y = h - th - pad;
+      if (position === 'bottom-left') { x = pad; }
+      else if (position === 'top-left') { x = pad; y = pad; }
+      else if (position === 'top-right') { x = w - tw - pad; y = pad; }
+      else if (position === 'center') { x = Math.floor((w - tw) / 2); y = Math.floor((h - th) / 2); }
+      else { x = w - tw - pad; }
+      img.print({ text, x, y, font, color: '#00000088' });
+    }
+    res.json({ success: true, font_loaded: !!font, data: outputImg(img, format) });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -214,7 +236,7 @@ app.post('/text/sticker', async (req, res) => {
     if (style === 'circle') {
       img = new Jimp({ width: size, height: size, color: '#00000000' });
       const r = size / 2;
-      const rInt = rgbaToInt(255, 255, 0, 255);
+      const rInt = cssColorToHex('#FFFF00FF');
       for (let y = 0; y < size; y++) {
         for (let x = 0; x < size; x++) {
           const dx = x - r, dy = y - r;
@@ -224,13 +246,15 @@ app.post('/text/sticker', async (req, res) => {
     } else {
       img = new Jimp({ width: size, height: size, color: '#FFFF00FF' });
     }
-    const font = await loadFont(Jimp.FONT_SANS_64_WHITE);
-    const tw = measureText(font, text);
-    const th = measureTextHeight(font, text, size);
-    const x = Math.floor((size - tw) / 2);
-    const y = Math.floor((size - th) / 2);
-    img.print({ text, x, y, font, color: '#000000FF' });
-    res.json({ success: true, data: outputImg(img, 'png') });
+    const font = await getFont(64);
+    if (font) {
+      const tw = measureText(font, text);
+      const th = measureTextHeight(font, text, size);
+      const x = Math.floor((size - tw) / 2);
+      const y = Math.floor((size - th) / 2);
+      img.print({ text, x, y, font, color: '#000000FF' });
+    }
+    res.json({ success: true, font_loaded: !!font, data: outputImg(img, 'png') });
   } catch (e) { res.status(500).json({ error: '贴纸生成失败: ' + e.message }); }
 });
 
